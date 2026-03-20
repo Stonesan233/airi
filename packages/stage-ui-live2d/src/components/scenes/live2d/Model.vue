@@ -355,12 +355,8 @@ async function loadModel() {
     initialModelWidth.value = model.value.width
     initialModelHeight.value = model.value.height
     console.info(`[Live2D] Model loaded: width=${initialModelWidth.value}, height=${initialModelHeight.value}, version=${version}`)
-    model.value.anchor.set(0.5, 0.5)
-    setScaleAndPosition()
 
-    console.info(`[Live2D] After setScaleAndPosition: scale=${model.value.scale.x}, x=${model.value.x}, y=${model.value.y}`)
-
-    // --- Cubism2-specific rendering fix
+    // --- Cubism2-specific rendering fix - MUST be applied BEFORE generic positioning
     // NOTICE: Cubism2 models (especially large 2000x2500) need different positioning,
     // texture flip (textureFlipY), and scale compared to Cubism4.
     if (version === 'cubism2') {
@@ -368,9 +364,13 @@ async function loadModel() {
       const stageW = app.screen.width || 1080
       const stageH = app.screen.height || 1920
 
+      console.info(`[Live2D] Cubism2 applying fix: stage=${stageW}x${stageH}, model=${initialModelWidth.value}x${initialModelHeight.value}`)
+
       // Ensure model is visible
       model.value.visible = true
       model.value.alpha = 1
+      model.value.skew.set(0, 0)
+      model.value.rotation = 0
 
       // Force textureFlipY - Cubism2 UVs are often flipped compared to WebGL default
       // Try true first (most common fix), if upside down, will need false
@@ -392,21 +392,33 @@ async function loadModel() {
       }
 
       // Calculate scale to fit the large model in stage (leave 10% margin)
-      let scale = Math.min(stageW / initialModelWidth.value * 0.9, stageH / initialModelHeight.value * 0.9)
-      // Prevent scale from being too small
-      scale = Math.max(scale, 0.3)
-      console.info(`[Live2D] Cubism2 fix: stage=${stageW}x${stageH}, model=${initialModelWidth.value}x${initialModelHeight.value}, scale=${scale}`)
+      // Use 0.85 for full fit, or try larger values like 1.0 to see the model
+      let scale = Math.min(stageW / initialModelWidth.value * 0.85, stageH / initialModelHeight.value * 0.85)
+      // Prevent scale from being too small - use at least 0.5 for visibility
+      scale = Math.max(scale, 0.5)
+      console.info(`[Live2D] Cubism2 calculated scale=${scale}`)
 
       // Anchor at bottom-center (feet/chin alignment for full-body models)
-      model.value.anchor.set(0.5, 0.9)
-      // Position at center-bottom of stage
-      model.value.position.set(stageW / 2, stageH * 0.95)
+      model.value.anchor.set(0.5, 0.92)
+      // Position at center-bottom of stage (leave some bottom margin)
+      model.value.position.set(stageW / 2, stageH * 0.9)
       model.value.scale.set(scale)
 
-      console.info(`[Live2D] Cubism2 after fix: anchor=${model.value.anchor.x},${model.value.anchor.y}, pos=${model.value.x},${model.value.y}, scale=${model.value.scale.x}`)
+      console.info(`[Live2D] Cubism2 FIXED: anchor=${model.value.anchor.x},${model.value.anchor.y}, pos=${model.value.x},${model.value.y}, scale=${model.value.scale.x}`)
 
       // Force an update
       ;(model.value as any).update(16)
+
+      // Debug: log bounds
+      const debugModel = model.value
+      setTimeout(() => {
+        console.info(`[Live2D] Cubism2 bounds:`, debugModel.getBounds())
+      }, 100)
+    }
+    else {
+      // Cubism4 default positioning
+      model.value.anchor.set(0.5, 0.5)
+      setScaleAndPosition()
     }
 
     // --- Interaction
