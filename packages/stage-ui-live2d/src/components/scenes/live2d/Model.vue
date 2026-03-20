@@ -372,11 +372,11 @@ async function loadModel() {
       model.value.skew.set(0, 0)
       model.value.rotation = 0
 
-      // First try textureFlipY = false (Cubism2 may need this instead of true)
+      // Try textureFlipY = false first (Cubism2 may need this)
       const internalModel = model.value.internalModel as any
       if (internalModel) {
         console.info(`[Live2D] Cubism2 before flip: textureFlipY =`, internalModel.textureFlipY)
-        internalModel.textureFlipY = false // Try false first
+        internalModel.textureFlipY = false
 
         // Also try to fix premultipliedAlpha if textures exist
         if (model.value.textures) {
@@ -390,21 +390,24 @@ async function loadModel() {
         console.info(`[Live2D] Cubism2 after flip: textureFlipY =`, internalModel.textureFlipY)
       }
 
-      // CRITICAL FIX: The bounds showed model at x=1599 with width=2000,
-      // meaning left edge is at -401 (off-screen left!)
-      // We need to reset position based on center alignment
-      // Use simple center positioning first: anchor center, position center
+      // CRITICAL FIX: Dynamic bounds-based offset calculation
+      // Get initial bounds to understand the offset
+      const initialBounds = model.value.getBounds()
+      console.info(`[Live2D] Cubism2 initial bounds: x=${initialBounds.x}, y=${initialBounds.y}, w=${initialBounds.width}, h=${initialBounds.height}`)
 
-      // Try scale 0.8 first (larger to ensure visibility)
-      const scale = 0.8
-
-      // Anchor at CENTER (not bottom) - this is key for Cubism2
+      // Reset anchor to center
       model.value.anchor.set(0.5, 0.5)
-      // Position at CENTER of stage
-      model.value.position.set(stageW / 2, stageH / 2)
+
+      // Set position to stage center
+      const stageCenterX = stageW / 2
+      const stageCenterY = stageH / 2
+      model.value.position.set(stageCenterX, stageCenterY)
+
+      // Apply scale - fit model in stage with margin
+      const scale = Math.min(stageW / initialBounds.width, stageH / initialBounds.height) * 0.9
       model.value.scale.set(scale)
 
-      console.info(`[Live2D] Cubism2 center position: anchor=${model.value.anchor.x},${model.value.anchor.y}, pos=${model.value.x},${model.value.y}, scale=${scale}`)
+      console.info(`[Live2D] Cubism2 FIXED: pos=${model.value.x},${model.value.y}, scale=${scale}`)
 
       // Force an update
       try {
@@ -417,7 +420,8 @@ async function loadModel() {
       // Debug: log bounds after positioning
       const debugModel = model.value
       setTimeout(() => {
-        console.info(`[Live2D] Cubism2 bounds after fix:`, debugModel.getBounds())
+        const newBounds = debugModel.getBounds()
+        console.info(`[Live2D] Cubism2 bounds after fix: x=${newBounds.x}, y=${newBounds.y}, w=${newBounds.width}, h=${newBounds.height}`)
       }, 100)
     }
     else {
