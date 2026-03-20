@@ -360,6 +360,37 @@ async function loadModel() {
 
     console.info(`[Live2D] After setScaleAndPosition: scale=${model.value.scale.x}, x=${model.value.x}, y=${model.value.y}`)
 
+    // --- Cubism2-specific rendering fix
+    // NOTICE: Cubism2 models (especially large 2000x2500) need different positioning
+    // and potentially texture flip compared to Cubism4.
+    if (version === 'cubism2') {
+      const app = pixiApp.value!
+      const stageW = app.screen.width
+      const stageH = app.screen.height
+
+      // Calculate scale to fit the large model in stage
+      const scale = Math.min(stageW / initialModelWidth.value * 0.85, stageH / initialModelHeight.value * 0.85)
+      console.info(`[Live2D] Cubism2 fix: stage=${stageW}x${stageH}, calculated scale=${scale}`)
+
+      // Set anchor to bottom-center (feet alignment) instead of center
+      model.value.anchor.set(0.5, 0.85)
+      // Position at bottom-center of stage
+      model.value.position.set(stageW * 0.5, stageH * 0.9)
+      model.value.scale.set(scale)
+
+      console.info(`[Live2D] Cubism2 after fix: anchor=${model.value.anchor.x},${model.value.anchor.y}, pos=${model.value.x},${model.value.y}, scale=${model.value.scale.x}`)
+
+      // Try to fix texture flip if needed
+      const internalModel = model.value.internalModel as any
+      if (internalModel) {
+        // Check if textureFlipY exists and try both values
+        console.info(`[Live2D] Cubism2 internal model:`, {
+          constructorName: internalModel.constructor?.name,
+          hasTextureFlipY: 'textureFlipY' in internalModel,
+        })
+      }
+    }
+
     // --- Interaction
 
     model.value.on('hit', (hitAreas: string[]) => {
