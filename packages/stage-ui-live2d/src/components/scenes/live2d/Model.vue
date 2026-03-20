@@ -372,12 +372,11 @@ async function loadModel() {
       model.value.skew.set(0, 0)
       model.value.rotation = 0
 
-      // Force textureFlipY - Cubism2 UVs are often flipped compared to WebGL default
-      // Try true first (most common fix), if upside down, will need false
+      // First try textureFlipY = false (Cubism2 may need this instead of true)
       const internalModel = model.value.internalModel as any
       if (internalModel) {
         console.info(`[Live2D] Cubism2 before flip: textureFlipY =`, internalModel.textureFlipY)
-        internalModel.textureFlipY = true
+        internalModel.textureFlipY = false // Try false first
 
         // Also try to fix premultipliedAlpha if textures exist
         if (model.value.textures) {
@@ -391,28 +390,34 @@ async function loadModel() {
         console.info(`[Live2D] Cubism2 after flip: textureFlipY =`, internalModel.textureFlipY)
       }
 
-      // Calculate scale to fit the large model in stage (leave 10% margin)
-      // Use 0.85 for full fit, or try larger values like 1.0 to see the model
-      let scale = Math.min(stageW / initialModelWidth.value * 0.85, stageH / initialModelHeight.value * 0.85)
-      // Prevent scale from being too small - use at least 0.5 for visibility
-      scale = Math.max(scale, 0.5)
-      console.info(`[Live2D] Cubism2 calculated scale=${scale}`)
+      // CRITICAL FIX: The bounds showed model at x=1599 with width=2000,
+      // meaning left edge is at -401 (off-screen left!)
+      // We need to reset position based on center alignment
+      // Use simple center positioning first: anchor center, position center
 
-      // Anchor at bottom-center (feet/chin alignment for full-body models)
-      model.value.anchor.set(0.5, 0.92)
-      // Position at center-bottom of stage (leave some bottom margin)
-      model.value.position.set(stageW / 2, stageH * 0.9)
+      // Try scale 0.8 first (larger to ensure visibility)
+      const scale = 0.8
+
+      // Anchor at CENTER (not bottom) - this is key for Cubism2
+      model.value.anchor.set(0.5, 0.5)
+      // Position at CENTER of stage
+      model.value.position.set(stageW / 2, stageH / 2)
       model.value.scale.set(scale)
 
-      console.info(`[Live2D] Cubism2 FIXED: anchor=${model.value.anchor.x},${model.value.anchor.y}, pos=${model.value.x},${model.value.y}, scale=${model.value.scale.x}`)
+      console.info(`[Live2D] Cubism2 center position: anchor=${model.value.anchor.x},${model.value.anchor.y}, pos=${model.value.x},${model.value.y}, scale=${scale}`)
 
       // Force an update
-      ;(model.value as any).update(16)
+      try {
+        ;(model.value as any).update(16)
+      }
+      catch (e) {
+        console.warn('[Live2D] Cubism2 update error:', e)
+      }
 
-      // Debug: log bounds
+      // Debug: log bounds after positioning
       const debugModel = model.value
       setTimeout(() => {
-        console.info(`[Live2D] Cubism2 bounds:`, debugModel.getBounds())
+        console.info(`[Live2D] Cubism2 bounds after fix:`, debugModel.getBounds())
       }, 100)
     }
     else {
