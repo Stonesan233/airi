@@ -2,8 +2,10 @@
 import { Application } from '@pixi/app'
 import { extensions } from '@pixi/extensions'
 import { Ticker, TickerPlugin } from '@pixi/ticker'
-import { Live2DModel } from 'pixi-live2d-display/cubism4'
+import { Live2DModel as Cubism4Model } from 'pixi-live2d-display/cubism4'
 import { onMounted, onUnmounted, ref, watch } from 'vue'
+
+import { importCubism2 } from '../../../utils/live2d-cubism2-runtime'
 
 const props = withDefaults(defineProps<{
   width: number
@@ -50,7 +52,19 @@ async function initLive2DPixiStage(parent: HTMLDivElement) {
   isPixiCanvasReady.value = false
 
   // https://guansss.github.io/pixi-live2d-display/#package-importing
-  Live2DModel.registerTicker(Ticker)
+  // Register both Cubism4 and Cubism2 tickers at initialization.
+  // This ensures either model type can update properly when loaded.
+  Cubism4Model.registerTicker(Ticker)
+
+  // Pre-warm and register Cubism2 ticker in background
+  try {
+    const cubism2 = await importCubism2()
+    cubism2.Live2DModel.registerTicker(Ticker)
+  }
+  catch {
+    // Missing live2d.min.js - only matters if user loads a Cubism 2 model
+  }
+
   extensions.add(TickerPlugin)
   // We handle the interactions (e.g., mouse-based focusing at) manually
   // extensions.add(InteractionManager)

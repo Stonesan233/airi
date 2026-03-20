@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import type { Application } from '@pixi/app'
+import type { Live2DModel } from 'pixi-live2d-display/cubism4'
 
 import type { PixiLive2DInternalModel } from '../../../composables/live2d'
+
+import JSZip from 'jszip'
 
 import { listenBeatSyncBeatSignal } from '@proj-airi/stage-shared/beat-sync'
 import { useTheme } from '@proj-airi/ui'
@@ -11,7 +14,7 @@ import { formatHex } from 'culori'
 import { Mutex } from 'es-toolkit'
 import { storeToRefs } from 'pinia'
 import { DropShadowFilter } from 'pixi-filters'
-import { Live2DFactory, Live2DModel, MotionPriority } from 'pixi-live2d-display/cubism4'
+import { Live2DFactory as Cubism4Factory, Live2DModel as Cubism4Model, MotionPriority } from 'pixi-live2d-display/cubism4'
 import { computed, onMounted, onUnmounted, ref, shallowRef, toRef, watch } from 'vue'
 
 import {
@@ -25,6 +28,9 @@ import {
 } from '../../../composables/live2d'
 import { Emotion, EmotionNeutralMotionName } from '../../../constants/emotions'
 import { useLive2d } from '../../../stores/live2d'
+import { resolveParamId } from '../../../utils/cubism2-param-ids'
+import { importCubism2 } from '../../../utils/live2d-cubism2-runtime'
+import { loadCubism2FilesFromZip } from '../../../utils/live2d-zip-loader'
 
 const props = withDefaults(defineProps<{
   modelSrc?: string
@@ -92,12 +98,47 @@ let isUnmounted = false
 
 const modelLoadMutex = new Mutex()
 
+/**
+ * Detect cubism version from model source.
+ * Cubism2: .moc file, model.json
+ * Cubism4: .moc3 file, model3.json
+ *
+ * For ZIP or blob URLs the URL itself carries no version hint, so we peek
+ * inside the archive and check for a bare `.moc` file (Cubism 2 marker).
+ */
+async function detectCubismVersion(modelSrc: string): Promise<'cubism2' | 'cubism4'> {
+  const src = modelSrc.toLowerCase()
+  // Direct file references are unambiguous
+  if (src.includes('.moc') && !src.includes('.moc3'))
+    return 'cubism2'
+  if (src.includes('model.json') && !src.includes('model3.json'))
+    return 'cubism2'
+
+  // For ZIP files or blob URLs, peek inside the archive
+  if (src.endsWith('.zip') || src.startsWith('blob:')) {
+    try {
+      const res = await fetch(modelSrc)
+      const blob = await res.blob()
+      const zip = await JSZip.loadAsync(blob)
+      const paths = Object.keys(zip.files)
+      const hasMoc2 = paths.some(p => p.endsWith('.moc') && !p.endsWith('.moc3'))
+      return hasMoc2 ? 'cubism2' : 'cubism4'
+    }
+    catch {
+      // Fall through to default on any fetch/parse error
+    }
+  }
+
+  return 'cubism4'
+}
+
 const offset = computed(() => parsePropsOffset())
 
 const pixiApp = toRef(() => props.app)
 const paused = toRef(() => props.paused)
 const focusAt = toRef(() => props.focusAt)
 const model = ref<Live2DModel<PixiLive2DInternalModel>>()
+const modelVersion = ref<'cubism2' | 'cubism4'>('cubism4')
 const initialModelWidth = ref<number>(0)
 const initialModelHeight = ref<number>(0)
 const mouthOpenSize = computed(() => Math.max(0, Math.min(100, props.mouthOpenSize)))
@@ -113,8 +154,17 @@ const dropShadowFilter = shallowRef(new DropShadowFilter({
   rotation: 45,
 }))
 
-function getCoreModel() {
-  return model.value!.internalModel.coreModel as any
+function setParam(paramId: string, value: number) {
+  if (!model.value)
+    return
+  const coreModel = model.value.internalModel.coreModel as any
+  const resolvedId = resolveParamId(paramId, modelVersion.value)
+  // NOTICE: Cubism 2 core model (Live2DModelWebGL) uses setParamFloat();
+  // Cubism 4 uses setParameterValueById(). The APIs are not interchangeable.
+  if (modelVersion.value === 'cubism2')
+    coreModel.setParamFloat(resolvedId, value)
+  else
+    coreModel.setParameterValueById(resolvedId, value)
 }
 
 let resizeAnimation: ReturnType<typeof animate> | undefined
@@ -253,8 +303,41 @@ async function loadModel() {
       return
     }
 
-    const live2DModel = new Live2DModel<PixiLive2DInternalModel>()
-    await Live2DFactory.setupLive2DModel(live2DModel, { url: modelSrcRef.value, id: props.modelId }, { autoInteract: false })
+    // Detect cubism version and use appropriate factory
+    const version = await detectCubismVersion(modelSrcRef.value)
+    console.info('[Live2D] Detected model version:', version)
+    modelVersion.value = version
+
+    let Factory: typeof Cubism4Factory
+    let live2DModel: Live2DModel<PixiLive2DInternalModel>
+
+    if (version === 'cubism2') {
+      const cubism2 = await importCubism2()
+      // Ticker is already registered in Canvas.vue at init time
+      Factory = cubism2.Live2DFactory as unknown as typeof Cubism4Factory
+      live2DModel = new cubism2.Live2DModel() as unknown as Live2DModel<PixiLive2DInternalModel>
+    }
+    else {
+      Factory = Cubism4Factory
+      live2DModel = new Cubism4Model<PixiLive2DInternalModel>()
+    }
+
+    // NOTICE: For Cubism 2 ZIP/blob sources we pre-extract the archive and attach
+    // a Cubism2ModelSettings object to the File array so that FileLoader uses it
+    // directly, bypassing ZipLoader.createSettings which calls Live2DFactory.findRuntime
+    // and fails with "Unknown settings JSON" due to runtime registration timing issues
+    // in pixi-live2d-display v0.4.x.
+    const src = modelSrcRef.value.toLowerCase()
+    const isZipSource = src.endsWith('.zip') || src.startsWith('blob:')
+    let modelSource: any = { url: modelSrcRef.value, id: props.modelId }
+
+    if (version === 'cubism2' && isZipSource) {
+      const response = await fetch(modelSrcRef.value)
+      const blob = await response.blob()
+      modelSource = await loadCubism2FilesFromZip(blob)
+    }
+
+    await Factory.setupLive2DModel(live2DModel, modelSource, { autoInteract: false })
     availableMotions.value.forEach((motion) => {
       if (motion.motionName in Emotion) {
         motionMap.value[motion.fileName] = motion.motionName
@@ -271,38 +354,47 @@ async function loadModel() {
     pixiApp.value!.stage.addChild(model.value)
     initialModelWidth.value = model.value.width
     initialModelHeight.value = model.value.height
+    console.info(`[Live2D] Model loaded: width=${initialModelWidth.value}, height=${initialModelHeight.value}, version=${version}`)
     model.value.anchor.set(0.5, 0.5)
     setScaleAndPosition()
 
+    console.info(`[Live2D] After setScaleAndPosition: scale=${model.value.scale.x}, x=${model.value.x}, y=${model.value.y}`)
+
     // --- Interaction
 
-    model.value.on('hit', (hitAreas) => {
+    model.value.on('hit', (hitAreas: string[]) => {
       if (model.value && hitAreas.includes('body'))
         model.value.motion('tap_body')
     })
 
     // --- Motion
 
-    const internalModel = model.value.internalModel
-    const coreModel = internalModel.coreModel
+    const internalModel = model.value.internalModel as PixiLive2DInternalModel
     const motionManager = internalModel.motionManager
-    coreModel.setParameterValueById('ParamMouthOpenY', mouthOpenSize.value)
+    setParam('ParamMouthOpenY', mouthOpenSize.value)
 
-    availableMotions.value = Object
-      .entries(motionManager.definitions)
-      .flatMap(([motionName, definition]) => (definition?.map((motion: any, index: number) => ({
-        motionName,
-        motionIndex: index,
-        fileName: motion.File,
-      })) || []))
-      .filter(Boolean)
+    if (!motionManager) {
+      console.warn('[Live2D] Motion manager not available for this model, some features will be skipped')
+    }
+
+    if (motionManager) {
+      availableMotions.value = Object
+        .entries(motionManager.definitions)
+        .flatMap(([motionName, definition]) => (definition?.map((motion: any, index: number) => ({
+          motionName,
+          motionIndex: index,
+          // NOTICE: Cubism 4 uses "File" (capital F), Cubism 2 uses "file" (lowercase)
+          fileName: motion.File ?? motion.file,
+        })) || []))
+        .filter(Boolean)
+    }
 
     // Check if user has selected a runtime motion to play as idle
     const selectedMotionGroup = localStorage.getItem('selected-runtime-motion-group')
     const selectedMotionIndex = localStorage.getItem('selected-runtime-motion-index')
 
-    // Configure the selected motion to loop
-    if (selectedMotionGroup !== null && selectedMotionIndex) {
+    // Configure the selected motion to loop (Cubism 4 only, uses motionGroups internal structure)
+    if (version === 'cubism4' && motionManager && selectedMotionGroup !== null && selectedMotionIndex) {
       const groupIndex = (motionManager.groups as Record<string, any>)[selectedMotionGroup]
       if (groupIndex !== undefined && motionManager.motionGroups[groupIndex]) {
         const motionIndex = Number.parseInt(selectedMotionIndex)
@@ -328,7 +420,8 @@ async function loadModel() {
     // Remove eye ball movements from idle motion group to prevent conflicts
     // This is too hacky
     // FIXME: it cannot blink if loading a model only have idle motion
-    if (motionManager.groups.idle) {
+    // Only apply to cubism4 models
+    if (version === 'cubism4' && motionManager?.groups?.idle) {
       motionManager.motionGroups[motionManager.groups.idle]?.forEach((motion) => {
         motion._motionData.curves.forEach((curve: any) => {
         // TODO: After emotion mapper, stage editor, eye related parameters should be take cared to be dynamical instead of hardcoding
@@ -340,70 +433,80 @@ async function loadModel() {
     }
 
     // This is hacky too
-    const motionManagerUpdate = useLive2DMotionManagerUpdate({
-      internalModel,
-      motionManager,
-      modelParameters,
-      live2dIdleAnimationEnabled,
-      live2dAutoBlinkEnabled,
-      live2dForceAutoBlinkEnabled,
-      lastUpdateTime,
-    })
+    // Only apply motion manager updates to cubism4 models
+    const motionManagerUpdate = (version === 'cubism4' && motionManager)
+      ? useLive2DMotionManagerUpdate({
+          internalModel,
+          motionManager,
+          modelParameters,
+          live2dIdleAnimationEnabled,
+          live2dAutoBlinkEnabled,
+          live2dForceAutoBlinkEnabled,
+          lastUpdateTime,
+        })
+      : null
 
-    motionManagerUpdate.register(useMotionUpdatePluginBeatSync(beatSync), 'pre')
-    motionManagerUpdate.register(useMotionUpdatePluginIdleDisable(), 'pre')
-    motionManagerUpdate.register(useMotionUpdatePluginIdleFocus(), 'post')
-    motionManagerUpdate.register(useMotionUpdatePluginAutoEyeBlink(), 'post')
+    // Register motion manager update plugins (cubism4 only)
+    if (motionManagerUpdate) {
+      motionManagerUpdate.register(useMotionUpdatePluginBeatSync(beatSync), 'pre')
+      motionManagerUpdate.register(useMotionUpdatePluginIdleDisable(), 'pre')
+      motionManagerUpdate.register(useMotionUpdatePluginIdleFocus(), 'post')
+      motionManagerUpdate.register(useMotionUpdatePluginAutoEyeBlink(), 'post')
 
-    const hookedUpdate = motionManager.update as (model: PixiLive2DInternalModel['coreModel'], now: number) => boolean
-    motionManager.update = function (model: PixiLive2DInternalModel['coreModel'], now: number) {
-      return motionManagerUpdate.hookUpdate(model, now, hookedUpdate)
+      const hookedUpdate = motionManager.update as (model: PixiLive2DInternalModel['coreModel'], now: number) => boolean
+      motionManager.update = function (model: PixiLive2DInternalModel['coreModel'], now: number) {
+        return motionManagerUpdate.hookUpdate(model, now, hookedUpdate)
+      }
     }
 
-    motionManager.on('motionStart', (group, index) => {
-      localCurrentMotion.value = { group, index }
-    })
+    if (motionManager) {
+      motionManager.on('motionStart', (group, index) => {
+        localCurrentMotion.value = { group, index }
+      })
+    }
 
     // Listen for motion finish to restart runtime motion for looping
-    motionManager.on('motionFinish', () => {
-      const selectedMotionGroup = localStorage.getItem('selected-runtime-motion-group')
-      const selectedMotionIndex = localStorage.getItem('selected-runtime-motion-index')
+    if (motionManager) {
+      motionManager.on('motionFinish', () => {
+        const selectedMotionGroup = localStorage.getItem('selected-runtime-motion-group')
+        const selectedMotionIndex = localStorage.getItem('selected-runtime-motion-index')
 
-      if (selectedMotionGroup !== null && selectedMotionIndex && live2dIdleAnimationEnabled.value) {
-        // Restart the selected runtime motion immediately for seamless looping
-        console.info('Motion finished, restarting runtime motion:', selectedMotionGroup, selectedMotionIndex)
-        // Use requestAnimationFrame to restart on the next frame for smooth transition
-        requestAnimationFrame(() => {
-          currentMotion.value = {
-            group: selectedMotionGroup,
-            index: Number.parseInt(selectedMotionIndex),
-          }
-        })
-      }
-    })
+        if (selectedMotionGroup !== null && selectedMotionIndex && live2dIdleAnimationEnabled.value) {
+          // Restart the selected runtime motion immediately for seamless looping
+          console.info('Motion finished, restarting runtime motion:', selectedMotionGroup, selectedMotionIndex)
+          // Use requestAnimationFrame to restart on the next frame for smooth transition
+          requestAnimationFrame(() => {
+            currentMotion.value = {
+              group: selectedMotionGroup,
+              index: Number.parseInt(selectedMotionIndex),
+            }
+          })
+        }
+      })
+    }
 
     // Apply all stored parameters to the model
-    coreModel.setParameterValueById('ParamAngleX', modelParameters.value.angleX)
-    coreModel.setParameterValueById('ParamAngleY', modelParameters.value.angleY)
-    coreModel.setParameterValueById('ParamAngleZ', modelParameters.value.angleZ)
-    coreModel.setParameterValueById('ParamEyeLOpen', modelParameters.value.leftEyeOpen)
-    coreModel.setParameterValueById('ParamEyeROpen', modelParameters.value.rightEyeOpen)
-    coreModel.setParameterValueById('ParamEyeSmile', modelParameters.value.leftEyeSmile)
-    coreModel.setParameterValueById('ParamBrowLX', modelParameters.value.leftEyebrowLR)
-    coreModel.setParameterValueById('ParamBrowRX', modelParameters.value.rightEyebrowLR)
-    coreModel.setParameterValueById('ParamBrowLY', modelParameters.value.leftEyebrowY)
-    coreModel.setParameterValueById('ParamBrowRY', modelParameters.value.rightEyebrowY)
-    coreModel.setParameterValueById('ParamBrowLAngle', modelParameters.value.leftEyebrowAngle)
-    coreModel.setParameterValueById('ParamBrowRAngle', modelParameters.value.rightEyebrowAngle)
-    coreModel.setParameterValueById('ParamBrowLForm', modelParameters.value.leftEyebrowForm)
-    coreModel.setParameterValueById('ParamBrowRForm', modelParameters.value.rightEyebrowForm)
-    coreModel.setParameterValueById('ParamMouthOpenY', modelParameters.value.mouthOpen)
-    coreModel.setParameterValueById('ParamMouthForm', modelParameters.value.mouthForm)
-    coreModel.setParameterValueById('ParamCheek', modelParameters.value.cheek)
-    coreModel.setParameterValueById('ParamBodyAngleX', modelParameters.value.bodyAngleX)
-    coreModel.setParameterValueById('ParamBodyAngleY', modelParameters.value.bodyAngleY)
-    coreModel.setParameterValueById('ParamBodyAngleZ', modelParameters.value.bodyAngleZ)
-    coreModel.setParameterValueById('ParamBreath', modelParameters.value.breath)
+    setParam('ParamAngleX', modelParameters.value.angleX)
+    setParam('ParamAngleY', modelParameters.value.angleY)
+    setParam('ParamAngleZ', modelParameters.value.angleZ)
+    setParam('ParamEyeLOpen', modelParameters.value.leftEyeOpen)
+    setParam('ParamEyeROpen', modelParameters.value.rightEyeOpen)
+    setParam('ParamEyeSmile', modelParameters.value.leftEyeSmile)
+    setParam('ParamBrowLX', modelParameters.value.leftEyebrowLR)
+    setParam('ParamBrowRX', modelParameters.value.rightEyebrowLR)
+    setParam('ParamBrowLY', modelParameters.value.leftEyebrowY)
+    setParam('ParamBrowRY', modelParameters.value.rightEyebrowY)
+    setParam('ParamBrowLAngle', modelParameters.value.leftEyebrowAngle)
+    setParam('ParamBrowRAngle', modelParameters.value.rightEyebrowAngle)
+    setParam('ParamBrowLForm', modelParameters.value.leftEyebrowForm)
+    setParam('ParamBrowRForm', modelParameters.value.rightEyebrowForm)
+    setParam('ParamMouthOpenY', modelParameters.value.mouthOpen)
+    setParam('ParamMouthForm', modelParameters.value.mouthForm)
+    setParam('ParamCheek', modelParameters.value.cheek)
+    setParam('ParamBodyAngleX', modelParameters.value.bodyAngleX)
+    setParam('ParamBodyAngleY', modelParameters.value.bodyAngleY)
+    setParam('ParamBodyAngleZ', modelParameters.value.bodyAngleZ)
+    setParam('ParamBreath', modelParameters.value.breath)
 
     emits('modelLoaded')
   }
@@ -427,7 +530,13 @@ async function setMotion(motionName: string, index?: number) {
 
   console.info('Setting motion:', motionName, 'index:', index)
   try {
-    await model.value.motion(motionName, index, MotionPriority.FORCE)
+    if (modelVersion.value === 'cubism2') {
+      // Cubism2 does not support MotionPriority
+      await model.value.motion(motionName, index)
+    }
+    else {
+      await model.value.motion(motionName, index, MotionPriority.FORCE)
+    }
     console.info('Motion started successfully:', motionName)
   }
   catch (error) {
@@ -488,151 +597,33 @@ watch([themeColorsHueDynamic, live2dShadowEnabled], ([dynamic, shadowEnabled]) =
   }
 }, { immediate: true })
 
-watch(mouthOpenSize, value => getCoreModel().setParameterValueById('ParamMouthOpenY', value))
+watch(mouthOpenSize, value => setParam('ParamMouthOpenY', value))
 watch(currentMotion, value => setMotion(value.group, value.index))
 watch(paused, value => value ? pixiApp.value?.stop() : pixiApp.value?.start())
 
 // Watch and apply model parameters
-watch(() => modelParameters.value.angleX, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamAngleX', value)
-  }
-})
-
-watch(() => modelParameters.value.angleY, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamAngleY', value)
-  }
-})
-
-watch(() => modelParameters.value.angleZ, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamAngleZ', value)
-  }
-})
-
-watch(() => modelParameters.value.leftEyeOpen, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamEyeLOpen', value)
-  }
-})
-
-watch(() => modelParameters.value.rightEyeOpen, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamEyeROpen', value)
-  }
-})
-
-watch(() => modelParameters.value.mouthOpen, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamMouthOpenY', value)
-  }
-})
-
-watch(() => modelParameters.value.mouthForm, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamMouthForm', value)
-  }
-})
-
-watch(() => modelParameters.value.cheek, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamCheek', value)
-  }
-})
-
-watch(() => modelParameters.value.bodyAngleX, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamBodyAngleX', value)
-  }
-})
-
-watch(() => modelParameters.value.bodyAngleY, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamBodyAngleY', value)
-  }
-})
-
-watch(() => modelParameters.value.bodyAngleZ, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamBodyAngleZ', value)
-  }
-})
-
-watch(() => modelParameters.value.breath, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamBreath', value)
-  }
-})
+watch(() => modelParameters.value.angleX, value => setParam('ParamAngleX', value))
+watch(() => modelParameters.value.angleY, value => setParam('ParamAngleY', value))
+watch(() => modelParameters.value.angleZ, value => setParam('ParamAngleZ', value))
+watch(() => modelParameters.value.leftEyeOpen, value => setParam('ParamEyeLOpen', value))
+watch(() => modelParameters.value.rightEyeOpen, value => setParam('ParamEyeROpen', value))
+watch(() => modelParameters.value.mouthOpen, value => setParam('ParamMouthOpenY', value))
+watch(() => modelParameters.value.mouthForm, value => setParam('ParamMouthForm', value))
+watch(() => modelParameters.value.cheek, value => setParam('ParamCheek', value))
+watch(() => modelParameters.value.bodyAngleX, value => setParam('ParamBodyAngleX', value))
+watch(() => modelParameters.value.bodyAngleY, value => setParam('ParamBodyAngleY', value))
+watch(() => modelParameters.value.bodyAngleZ, value => setParam('ParamBodyAngleZ', value))
+watch(() => modelParameters.value.breath, value => setParam('ParamBreath', value))
 
 // Watch eyebrow parameters
-watch(() => modelParameters.value.leftEyebrowLR, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamBrowLX', value)
-  }
-})
-
-watch(() => modelParameters.value.rightEyebrowLR, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamBrowRX', value)
-  }
-})
-
-watch(() => modelParameters.value.leftEyebrowY, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamBrowLY', value)
-  }
-})
-
-watch(() => modelParameters.value.rightEyebrowY, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamBrowRY', value)
-  }
-})
-
-watch(() => modelParameters.value.leftEyebrowAngle, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamBrowLAngle', value)
-  }
-})
-
-watch(() => modelParameters.value.rightEyebrowAngle, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamBrowRAngle', value)
-  }
-})
-
-watch(() => modelParameters.value.leftEyebrowForm, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamBrowLForm', value)
-  }
-})
-
-watch(() => modelParameters.value.rightEyebrowForm, (value) => {
-  if (model.value) {
-    const internalModel = model.value.internalModel
-    internalModel.coreModel.setParameterValueById('ParamBrowRForm', value)
-  }
-})
+watch(() => modelParameters.value.leftEyebrowLR, value => setParam('ParamBrowLX', value))
+watch(() => modelParameters.value.rightEyebrowLR, value => setParam('ParamBrowRX', value))
+watch(() => modelParameters.value.leftEyebrowY, value => setParam('ParamBrowLY', value))
+watch(() => modelParameters.value.rightEyebrowY, value => setParam('ParamBrowRY', value))
+watch(() => modelParameters.value.leftEyebrowAngle, value => setParam('ParamBrowLAngle', value))
+watch(() => modelParameters.value.rightEyebrowAngle, value => setParam('ParamBrowRAngle', value))
+watch(() => modelParameters.value.leftEyebrowForm, value => setParam('ParamBrowLForm', value))
+watch(() => modelParameters.value.rightEyebrowForm, value => setParam('ParamBrowRForm', value))
 
 // Watch for idle animation setting changes and stop motions if disabled
 watch(live2dIdleAnimationEnabled, (enabled) => {

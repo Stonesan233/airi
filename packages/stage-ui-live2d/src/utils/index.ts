@@ -1,5 +1,7 @@
-export { randomSaccadeInterval } from './eye-motions'
+export * from './cubism2-param-ids'
 
+export { randomSaccadeInterval } from './eye-motions'
+export * from './live2d-cubism2-runtime'
 export * from './live2d-opfs-registration'
 export * from './live2d-preview'
 export * from './live2d-uri-encode-filenames'
